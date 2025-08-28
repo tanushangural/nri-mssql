@@ -6,7 +6,9 @@ import (
 	"os"
 	"runtime"
 	"strings"
+	"time"
 
+	"github.com/newrelic/go-agent/v3/newrelic"
 	"github.com/newrelic/infra-integrations-sdk/v3/integration"
 	"github.com/newrelic/infra-integrations-sdk/v3/log"
 
@@ -37,6 +39,35 @@ func main() {
 		log.Error(err.Error())
 		os.Exit(1)
 	}
+
+	// Create an Application:
+	app, err := newrelic.NewApplication(
+		// Name your application
+		newrelic.ConfigAppName(args.ApplicationName),
+		// Fill in your New Relic license key
+		newrelic.ConfigLicense(args.YourLicenceKey),
+		// Add logging:
+		newrelic.ConfigDebugLogger(os.Stdout),
+		// Optional: add additional changes to your configuration via a config function:
+		func(cfg *newrelic.Config) {
+			cfg.CustomInsightsEvents.Enabled = true
+		},
+	)
+
+	// If an application could not be created then err will reveal why.
+	if err != nil {
+		log.Debug("unable to create New Relic Application", err)
+		return
+	}
+	defer app.Shutdown(10 * time.Second) // Use the app variable
+
+	// Ensure the application is connected
+	if err := app.WaitForConnection(10 * time.Second); err != nil {
+		log.Debug("New Relic Application did not connect:", err)
+		return
+	}
+
+	totalNriMsSqlExecutionTime := app.StartTransaction("TotalNriMsSqlExecutionTime")
 
 	if args.ShowVersion {
 		fmt.Printf(
@@ -103,6 +134,7 @@ func main() {
 	}
 
 	if args.EnableQueryMonitoring {
-		queryanalysis.PopulateQueryPerformanceMetrics(i, args)
+		queryanalysis.PopulateQueryPerformanceMetrics(i, args, app)
 	}
+	totalNriMsSqlExecutionTime.End()
 }

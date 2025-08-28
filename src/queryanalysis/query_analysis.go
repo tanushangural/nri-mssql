@@ -1,6 +1,7 @@
 package queryanalysis
 
 import (
+	"github.com/newrelic/go-agent/v3/newrelic"
 	"github.com/newrelic/infra-integrations-sdk/v3/integration"
 	"github.com/newrelic/infra-integrations-sdk/v3/log"
 	"github.com/newrelic/nri-mssql/src/args"
@@ -11,7 +12,8 @@ import (
 )
 
 // queryPerformanceMain runs all types of analyzes
-func PopulateQueryPerformanceMetrics(integration *integration.Integration, arguments args.ArgumentList) {
+func PopulateQueryPerformanceMetrics(integration *integration.Integration, arguments args.ArgumentList, app *newrelic.Application) {
+	createConnectionTxn := app.StartTransaction("createSQLConnection")
 	// Create a new connection
 	log.Debug("Starting query analysis...")
 
@@ -21,6 +23,9 @@ func PopulateQueryPerformanceMetrics(integration *integration.Integration, argum
 		return
 	}
 	defer sqlConnection.Close()
+	createConnectionTxn.End()
+
+	validatePreConditionTxn := app.StartTransaction("validatingPreCondition")
 
 	// Validate preconditions
 	isPreconditionPassed := validation.ValidatePreConditions(sqlConnection)
@@ -29,7 +34,11 @@ func PopulateQueryPerformanceMetrics(integration *integration.Integration, argum
 		return
 	}
 
+	validatePreConditionTxn.End()
+
 	utils.ValidateAndSetDefaults(&arguments)
+
+	loadQueriesTxn := app.StartTransaction("loadQueries")
 
 	queries := config.Queries
 	queryDetails, err := utils.LoadQueries(queries, arguments)
@@ -38,17 +47,25 @@ func PopulateQueryPerformanceMetrics(integration *integration.Integration, argum
 		return
 	}
 
+	loadQueriesTxn.End()
+
 	for _, queryDetailsDto := range queryDetails {
+		executeAndBindModelTxn := app.StartTransaction("ExecuteQueriesAndBindModels")
 		queryResults, err := utils.ExecuteQuery(arguments, queryDetailsDto, integration, sqlConnection)
 		if err != nil {
 			log.Error("Failed to execute query: %s", err)
 			continue
 		}
+		executeAndBindModelTxn.End()
+
+		dataInjestionTxn := app.StartTransaction("IngestDataInBatches")
+
 		err = utils.IngestQueryMetricsInBatches(queryResults, queryDetailsDto, integration, sqlConnection)
 		if err != nil {
 			log.Error("Failed to ingest metrics: %s", err)
 			continue
 		}
+		dataInjestionTxn.End()
 	}
 	log.Debug("Query analysis completed")
 }
