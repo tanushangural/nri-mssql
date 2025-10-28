@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -13,6 +14,7 @@ import (
 	"github.com/newrelic/nri-mssql/src/metrics"
 
 	"github.com/jmoiron/sqlx"
+	"github.com/newrelic/infra-integrations-sdk/v3/data/attribute"
 	"github.com/newrelic/infra-integrations-sdk/v3/data/metric"
 	"github.com/newrelic/infra-integrations-sdk/v3/integration"
 	"github.com/newrelic/infra-integrations-sdk/v3/log"
@@ -28,11 +30,13 @@ var (
 	// literalAnonymizer is a regular expression pattern used to match and identify
 	// certain types of literal values in a string. Specifically, it matches:
 	// 1. Single-quoted character sequences, such as 'example'.
-	// 2. Numeric sequences (integer numbers), such as 123 or 456.
+	// 2. Numeric sequences (integers and decimals), such as 123, 456.78, or .99.
 	// 3. Double-quoted strings, such as "example".
 	// This regex can be useful for identifying and potentially anonymizing literal values
 	// in a given text, like extracting or concealing specific data within strings.
 	literalAnonymizer = regexp.MustCompile(`'[^']*'|\d+|".*?"`)
+	// dmvCommentRemover removes DMV comments like /* DMV_POP_1761636289952111000_85288 */ from the beginning of queries
+	dmvCommentRemover = regexp.MustCompile(`^\s*/\*\s*DMV_[^*]*\*/\s*`)
 )
 
 // queryFormatter defines a function type for formatting a query string.
@@ -52,8 +56,9 @@ func formatSlowQueries(query string, args args.ArgumentList) string {
 }
 
 // formatWaitAnalysis formats the wait analysis query.
+// Updated for the simplified query with fixed TOP value (no parameters needed)
 func formatWaitAnalysis(query string, args args.ArgumentList) string {
-	return fmt.Sprintf(query, args.QueryMonitoringCountThreshold, config.TextTruncateLimit)
+	return query
 }
 
 // formatBlockingSessions formats the blocking sessions query.
@@ -79,13 +84,11 @@ func LoadQueries(queries []models.QueryDetailsDto, arguments args.ArgumentList) 
 }
 
 func ExecuteQuery(arguments args.ArgumentList, queryDetailsDto models.QueryDetailsDto, integration *integration.Integration, sqlConnection *connection.SQLConnection) ([]interface{}, error) {
-	log.Debug("Executing query: %s", queryDetailsDto.Query)
 	rows, err := sqlConnection.Connection.Queryx(queryDetailsDto.Query)
 	if err != nil {
 		return nil, fmt.Errorf("failed to execute query: %w", err)
 	}
 	defer rows.Close()
-	log.Debug("Query executed: %s", queryDetailsDto.Query)
 	result, queryIDs, err := BindQueryResults(arguments, rows, queryDetailsDto, integration, sqlConnection)
 	rows.Close()
 
@@ -106,6 +109,39 @@ func BindQueryResults(arguments args.ArgumentList,
 	results := make([]interface{}, 0)
 	queryIDs := make([]models.HexString, 0) // List to collect queryIDs for all slowQueries to process execution plans
 
+	// Special handling for waitAnalysis to collect all results first, then sort and filter
+	if queryDetailsDto.Type == "waitAnalysis" {
+		waitResults := make([]models.WaitTimeAnalysis, 0)
+
+		for rows.Next() {
+			var model models.WaitTimeAnalysis
+			if err := rows.StructScan(&model); err != nil {
+				log.Debug("Could not scan waitAnalysis row: ", err)
+				continue
+			}
+
+			waitResults = append(waitResults, model)
+		}
+
+		// Sort and filter to get top N by wait time (using QueryMonitoringCountThreshold)
+		topWaitResults := sortAndFilterWaitAnalysis(waitResults, arguments.QueryMonitoringCountThreshold)
+
+		// Now process query text for only the top N results: remove DMV comments first, then anonymize
+		for i := range topWaitResults {
+			if topWaitResults[i].QueryText != nil {
+				// Step 1: Remove DMV comments
+				cleanedQuery := RemoveDMVComments(*topWaitResults[i].QueryText)
+				// Step 2: Anonymize literals
+				*topWaitResults[i].QueryText = AnonymizeQueryText(cleanedQuery)
+			}
+
+			results = append(results, topWaitResults[i])
+		}
+
+		return results, queryIDs, nil
+	}
+
+	// Original logic for other query types
 	for rows.Next() {
 		switch queryDetailsDto.Type {
 		case "slowQueries":
@@ -123,17 +159,6 @@ func BindQueryResults(arguments args.ArgumentList,
 			if model.QueryID != nil {
 				queryIDs = append(queryIDs, *model.QueryID)
 			}
-
-		case "waitAnalysis":
-			var model models.WaitTimeAnalysis
-			if err := rows.StructScan(&model); err != nil {
-				log.Debug("Could not scan row: ", err)
-				continue
-			}
-			if model.QueryText != nil {
-				*model.QueryText = AnonymizeQueryText(*model.QueryText)
-			}
-			results = append(results, model)
 		case "blockingSessions":
 			var model models.BlockingSessionQueryDetails
 			if err := rows.StructScan(&model); err != nil {
@@ -151,6 +176,7 @@ func BindQueryResults(arguments args.ArgumentList,
 			return nil, queryIDs, fmt.Errorf("%w: %s", ErrUnknownQueryType, queryDetailsDto.Type)
 		}
 	}
+
 	return results, queryIDs, nil
 }
 
@@ -267,8 +293,13 @@ func IngestQueryMetrics(results []interface{}, queryDetailsDto models.QueryDetai
 			continue
 		}
 
-		// Create a new metric set with the query name
-		metricSet := instanceEntity.NewMetricSet(queryDetailsDto.EventName)
+		// Create a new metric set with the query name and required attributes
+		metricSet := instanceEntity.NewMetricSet(queryDetailsDto.EventName,
+			attribute.Attribute{Key: "displayName", Value: instanceEntity.Metadata.Name},
+			attribute.Attribute{Key: "entityName", Value: instanceEntity.Metadata.Namespace + ":" + instanceEntity.Metadata.Name},
+			attribute.Attribute{Key: "host", Value: sqlConnection.Host},
+			attribute.Attribute{Key: "reportingEndpoint", Value: sqlConnection.Host},
+		)
 
 		// Iterate over the map and add each key-value pair as a metric
 		for key, value := range resultMap {
@@ -284,16 +315,56 @@ func IngestQueryMetrics(results []interface{}, queryDetailsDto models.QueryDetai
 			}
 		}
 	}
+
 	err = integration.Publish()
 	if err != nil {
+		log.Error("IngestQueryMetrics - Failed to publish metrics: %v", err)
 		return err
 	}
+
 	return nil
 }
 
 func AnonymizeQueryText(query string) string {
+	// Anonymize literals only - this is a generic function
 	anonymizedQuery := literalAnonymizer.ReplaceAllString(query, "?")
 	return anonymizedQuery
+}
+
+// RemoveDMVComments removes DMV comments like /* DMV_POP_1761636289952111000_85288 */ from the beginning of query text
+func RemoveDMVComments(query string) string {
+	return dmvCommentRemover.ReplaceAllString(query, "")
+}
+
+// sortAndFilterWaitAnalysis sorts wait analysis results by TotalWaitTimeMs descending and takes top N records
+func sortAndFilterWaitAnalysis(waitResults []models.WaitTimeAnalysis, maxResults int) []models.WaitTimeAnalysis {
+	// Handle case where maxResults is 0 or negative - return all results
+	if maxResults <= 0 {
+		maxResults = len(waitResults)
+	}
+
+	// Sort by TotalWaitTimeMs descending
+	sort.Slice(waitResults, func(i, j int) bool {
+		if waitResults[i].TotalWaitTimeMs == nil && waitResults[j].TotalWaitTimeMs == nil {
+			return false
+		}
+		if waitResults[i].TotalWaitTimeMs == nil {
+			return false
+		}
+		if waitResults[j].TotalWaitTimeMs == nil {
+			return true
+		}
+		return *waitResults[i].TotalWaitTimeMs > *waitResults[j].TotalWaitTimeMs
+	})
+
+	// Take top N or all if less than N
+	if len(waitResults) < maxResults {
+		maxResults = len(waitResults)
+	}
+
+	topResults := waitResults[:maxResults]
+
+	return topResults
 }
 
 // ValidateAndSetDefaults checks if fields are invalid and sets defaults
