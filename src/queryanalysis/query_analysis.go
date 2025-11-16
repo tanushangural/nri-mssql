@@ -25,7 +25,6 @@ func PopulateQueryPerformanceMetrics(integration *integration.Integration, argum
 	// Validate preconditions
 	isPreconditionPassed := validation.ValidatePreConditions(sqlConnection)
 	if !isPreconditionPassed {
-		log.Error("Error validating preconditions")
 		return
 	}
 
@@ -33,19 +32,19 @@ func PopulateQueryPerformanceMetrics(integration *integration.Integration, argum
 
 	queryDetails, err := utils.LoadQueries(config.Queries, arguments)
 	if err != nil {
-		log.Error("Error loading query configuration: %v", err)
+		log.Error("Error loading query configuration: %s", err.Error())
 		return
 	}
 
 	for _, queryDetailsDto := range queryDetails {
 		queryResults, err := utils.ExecuteQuery(arguments, queryDetailsDto, integration, sqlConnection)
 		if err != nil {
-			log.Error("Failed to execute query: %s", err)
+			log.Error("Failed to execute query %s : %s", queryDetailsDto.Type, err.Error())
 			continue
 		}
 		err = utils.IngestQueryMetricsInBatches(queryResults, queryDetailsDto, integration, sqlConnection)
 		if err != nil {
-			log.Error("Failed to ingest metrics: %s", err)
+			log.Error("Failed to ingest metrics: %s", err.Error())
 			continue
 		}
 	}
